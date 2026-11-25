@@ -1,5 +1,10 @@
+####################################################################################################################
+# WARNING: Do not store sensitive information in this file, as its contents will be included in the Qodana report. #
+####################################################################################################################
+
 version: "1.0"
-# The paid linter. It needs QODANA_TOKEN and reads the coverage report in .qodana/code-coverage.
-linter: jetbrains/qodana-js:2026.3
+linter: qodana-js
 profile:
   name: qodana.recommended
+include:
+  - name: CheckDependencyLicenses
