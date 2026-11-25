@@ -4,6 +4,9 @@ const BASE_PRICE = 4.5;
 const PRICE_PER_KILOGRAM = 1.2;
 const EXPRESS_FACTOR = 1.5;
 const MAXIMUM_WEIGHT = 30;
+const HEAVY_WEIGHT = 20;
+const HEAVY_SURCHARGE = 3;
+const FRAGILE_SURCHARGE = 2.5;
 
 /** Returns `amount` as a price with two decimals. */
 function rounded(amount: number): number {
@@ -31,4 +34,16 @@ export function cheapest(weights: readonly number[]): number {
     throw new RangeError("no parcel given");
   }
   return Math.min(...weights.map((weight) => shippingPrice(weight)));
+}
+
+/** Returns the surcharge for a heavy or a fragile parcel. */
+export function surcharge(weight: number, fragile = false): number {
+  let extra = 0;
+  if (weight > HEAVY_WEIGHT) {
+    extra += HEAVY_SURCHARGE;
+  }
+  if (fragile) {
+    extra += FRAGILE_SURCHARGE;
+  }
+  return extra;
 }
