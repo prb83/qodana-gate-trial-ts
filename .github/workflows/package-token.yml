@@ -1,0 +1,20 @@
+name: Package token
+
+# Started by hand. It shows whether the secret can read the gate package.
+on: workflow_dispatch
+
+permissions: {}
+
+jobs:
+  check:
+    name: Read the gate package
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Ask the registry for the published versions
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.TS_SECRET }}
+        run: |
+          if [ -z "$NODE_AUTH_TOKEN" ]; then echo "The secret is empty or missing."; exit 1; fi
+          printf '%s\n' '@paragondata:registry=https://npm.pkg.github.com' '//npm.pkg.github.com/:_authToken=${NODE_AUTH_TOKEN}' > .npmrc
+          npm view @paragondata/factory-quality-gate dist-tags --json
