@@ -1,0 +1,335 @@
+name: Quality
+
+# Only a pull request starts a run.
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: quality-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # One exact version of the quality gate; an update is a change of this file.
+  QUALITY_GATE_VERSION: "0.2.0-next.0"
+
+jobs:
+  qodana:
+    name: Tests and Qodana
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      checks: write
+      pull-requests: write
+    steps:
+      - name: Check out the commit of the pull request
+        uses: actions/checkout@v5
+        with:
+          # The head commit, not the merge commit; the full history for the pull-request mode.
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          fetch-depth: 0
+
+      # One Node for the project and for the gate.
+      - name: Set up Node
+        uses: actions/setup-node@v6
+        with:
+          node-version: 24.19.0
+          package-manager-cache: false
+
+      - name: Install the packages of the project
+        run: npm ci --no-audit --no-fund
+
+      - name: Check the types
+        run: npm run typecheck
+
+      # One report of one tool, in the directory that Qodana reads: the LCOV file that Vitest
+      # writes (vitest.config.ts). The paths in it are relative to the project root.
+      - name: Run the tests with coverage
+        run: npm run coverage
+
+      # The copy outside the checkout is the input of the local analyser further down.
+      - name: Show and copy the coverage report
+        run: |
+          ls -l .qodana/code-coverage
+          grep -E '^(SF|LF|LH|BRF|BRH):' .qodana/code-coverage/lcov.info
+          mkdir -p "$RUNNER_TEMP/quality/measurements"
+          cp .qodana/code-coverage/lcov.info "$RUNNER_TEMP/quality/measurements/lcov.info"
+
+      # The paid linter checks its licence with the project token. Only this step gets the token.
+      # Qodana runs in a container with the project at /data/project, so `args` names the
+      # coverage directory by its path there.
+      - name: Run Qodana
+        uses: JetBrains/qodana-action@v2026.3.1
+        env:
+          QODANA_TOKEN: ${{ secrets.QODANA_TOKEN }}
+        with:
+          args: --coverage-dir /data/project/.qodana/code-coverage
+          pr-mode: true
+          results-dir: ${{ runner.temp }}/qodana/results
+          # The repository is public: the action uploads nothing. See the step that keeps the result files.
+          upload-result: false
+          artifact-name: qodana-results
+          use-caches: false
+          post-pr-comment: true
+
+      # The quality gate reads the result file of the finished Qodana run. Every step from here on
+      # has `if: ${{ !cancelled() }}`: the Qodana step fails when a threshold of qodana.yaml fails,
+      # and the gate must still run and comment. The gate goes into a clean directory outside the
+      # checkout. Only this step gets the packages token.
+      - name: Install the gate
+        if: ${{ !cancelled() }}
+        env:
+          GITHUB_PACKAGES_TOKEN: ${{ secrets.TS_SECRET }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/quality/gate"
+          cd "$RUNNER_TEMP/quality/gate"
+          echo '{ "private": true }' > package.json
+          printf '%s\n' '@paragondata:registry=https://npm.pkg.github.com' \
+            '//npm.pkg.github.com/:_authToken=${GITHUB_PACKAGES_TOKEN}' > .npmrc
+          npm install --no-audit --no-fund --ignore-scripts \
+            "@paragondata/factory-quality-gate@$QUALITY_GATE_VERSION"
+
+      - name: Show the gate version
+        if: ${{ !cancelled() }}
+        run: |
+          "$RUNNER_TEMP/quality/gate/node_modules/.bin/factory-quality-gate" --version
+
+      # For the live checks only: what the Qodana step left. It prints a few fields of each result
+      # file and no finding.
+      - name: Show the Qodana results directory
+        if: ${{ !cancelled() }}
+        env:
+          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+          RESULTS: ${{ runner.temp }}/qodana/results
+        run: |
+          echo "event: $GITHUB_EVENT_NAME"
+          echo "head commit: $HEAD_SHA"
+          echo "GITHUB_SHA: $GITHUB_SHA"
+          echo "checked out now: $(git rev-parse HEAD)"
+          ls -la "$RESULTS" || true
+          for file in qodana.sarif.json qodana-short.sarif.json start/qodana.sarif.json end/qodana.sarif.json; do
+            node -e '
+              const fs = require("node:fs");
+              const [file, head] = process.argv.slice(1);
+              if (!fs.existsSync(file)) {
+                console.log(file + ": absent");
+                process.exit(0);
+              }
+              const run = JSON.parse(fs.readFileSync(file, "utf8")).runs?.[0] ?? {};
+              const invocation = run.invocations?.[0] ?? {};
+              const revision = run.versionControlProvenance?.[0]?.revisionId ?? null;
+              const facts = {
+                bytes: fs.statSync(file).size,
+                linter: (run.tool?.driver?.name ?? null) + " " + (run.tool?.driver?.version ?? null),
+                revisionId: revision,
+                revisionIsHead: revision === head,
+                exitCode: invocation.exitCode ?? null,
+                exitCodeDescription: invocation.exitCodeDescription ?? null,
+                analysisKind: run.automationDetails?.properties?.analysisKind ?? null,
+                baselineSource: run.properties?.baselineSource ?? null,
+                coverageFilesProvided: run.properties?.["qodana.coverage.files.provided"] ?? null,
+                coverage: run.properties?.coverage ?? null,
+                failureConditions: run.properties?.qodanaFailureConditions ?? null,
+                results: Array.isArray(run.results) ? run.results.length : null,
+              };
+              console.log(file + ": " + JSON.stringify(facts));
+            ' "$RESULTS/$file" "$HEAD_SHA"
+          done
+
+      # The verdict. The paid linter writes the coverage of the new code in pull-request mode, so
+      # the gate checks it against its default minimum. Only complexity is not checked. The step
+      # ends with the exit code of the gate: 0 passed, 2 failed, 1 unavailable.
+      - name: Run the gate
+        if: ${{ !cancelled() }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+          RESULTS: ${{ runner.temp }}/qodana/results
+        run: |
+          out="$RUNNER_TEMP/quality/out/verdict"
+          mkdir -p "$out"
+          # A push to main has no pull request to comment on.
+          scope=()
+          if [ -n "$PR_NUMBER" ]; then scope=(--pr "$PR_NUMBER" --comment); fi
+          gate=("$RUNNER_TEMP/quality/gate/node_modules/.bin/factory-quality-gate"
+            --analyser qodana
+            --qodana-results "$RESULTS"
+            --without-complexity
+            --commit "$HEAD_SHA"
+            "${scope[@]}"
+            --out "$out/quality.json"
+            --comment-file "$out/comment.md")
+          printf '%q ' "${gate[@]}" | tee "$out/command.txt"
+          echo
+          # The exit code of the gate, not of tee.
+          set +e
+          "${gate[@]}" 2>&1 | tee "$out/output.txt"
+          code=${PIPESTATUS[0]}
+          set -e
+          echo "$code" > "$out/exit-code.txt"
+          echo "gate exit code: $code"
+          exit "$code"
+
+      # For the trial checks only: Qodana's own result alone, the directory of the first stage, and
+      # the coverage minimum at and just above the value of the file. They post no comment and
+      # never fail the job.
+      - name: Run the gate variants of the trial checks
+        if: ${{ !cancelled() }}
+        env:
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+          RESULTS: ${{ runner.temp }}/qodana/results
+        run: |
+          scope=()
+          if [ -n "$PR_NUMBER" ]; then scope=(--pr "$PR_NUMBER"); fi
+          variant() {
+            local name="$1"
+            shift
+            local out="$RUNNER_TEMP/quality/out/$name"
+            mkdir -p "$out"
+            local gate=("$RUNNER_TEMP/quality/gate/node_modules/.bin/factory-quality-gate"
+              --analyser qodana
+              "$@"
+              "${scope[@]}"
+              --out "$out/quality.json"
+              --comment-file "$out/comment.md"
+              --summary "$out/summary.md")
+            echo "::group::$name"
+            printf '%q ' "${gate[@]}" | tee "$out/command.txt"
+            echo
+            # The exit code of the gate, not of tee.
+            set +e
+            "${gate[@]}" 2>&1 | tee "$out/output.txt"
+            local code=${PIPESTATUS[0]}
+            set -e
+            echo "$code" > "$out/exit-code.txt"
+            echo "gate exit code: $code"
+            echo "::endgroup::"
+          }
+          variant both-opt-outs --qodana-results "$RESULTS" --without-coverage --without-complexity --commit "$HEAD_SHA"
+          variant start-directory --qodana-results "$RESULTS/start" --without-complexity --commit "$HEAD_SHA"
+          # The line coverage of the new code as the gate computes it: covered lines by lines,
+          # rounded down to one decimal. Empty when the file has no usable counts.
+          value="$(node -e '
+            const fs = require("node:fs");
+            let coverage;
+            try {
+              coverage = JSON.parse(fs.readFileSync(process.argv[1], "utf8")).runs?.[0]?.properties?.coverage;
+            } catch {
+              coverage = undefined;
+            }
+            const lines = coverage?.freshLines;
+            const covered = coverage?.freshCoveredLines;
+            const counts = [lines, covered].every((n) => typeof n === "number" && Number.isFinite(n) && n >= 0);
+            if (counts && lines > 0 && covered <= lines) {
+              console.log(Math.floor((covered * 1000) / lines) / 10);
+            }
+          ' "$RESULTS/qodana.sarif.json")"
+          echo "line coverage of the new code, from the two counts of the file: ${value:-none}"
+          if [ -n "$value" ]; then
+            above="$(node -e 'console.log((Number(process.argv[1]) + 0.1).toFixed(1))' "$value")"
+            variant minimum-at --qodana-results "$RESULTS" --without-complexity --commit "$HEAD_SHA" --coverage-minimum "$value"
+            variant minimum-above --qodana-results "$RESULTS" --without-complexity --commit "$HEAD_SHA" --coverage-minimum "$above"
+          fi
+
+      # Extra, for information only: the gate's own analyser on the same commit and the same
+      # coverage report, so that its changed-line coverage stands next to the coverage that
+      # Qodana reports for the new code. It posts no comment and never fails the job.
+      - name: Run the local analyser for comparison
+        if: ${{ !cancelled() }}
+        env:
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+          BASE_REF: ${{ github.base_ref }}
+        run: |
+          out="$RUNNER_TEMP/quality/out/local"
+          mkdir -p "$out"
+          # Qodana checks out other commits in pull-request mode. The local analyser reads the
+          # working tree, so the head commit must be checked out again.
+          {
+            echo "head commit: $HEAD_SHA"
+            echo "checked out after Qodana: $(git rev-parse HEAD)"
+            if [ "$(git rev-parse HEAD)" != "$HEAD_SHA" ]; then
+              git checkout --quiet --detach "$HEAD_SHA" || echo "could not check out the head commit"
+              echo "checked out now: $(git rev-parse HEAD)"
+            fi
+            echo "changes of tracked files (none expected):"
+            git status --porcelain --untracked-files=no
+            echo "merge base with origin/$BASE_REF: $(git merge-base "origin/$BASE_REF" HEAD || echo none)"
+          } 2>&1 | tee "$out/working-tree.txt"
+          # An empty config file: the built-in targets, not a file of the change.
+          : > "$RUNNER_TEMP/quality/config.yaml"
+          scope=()
+          if [ -n "$PR_NUMBER" ]; then scope=(--pr "$PR_NUMBER"); fi
+          gate=("$RUNNER_TEMP/quality/gate/node_modules/.bin/factory-quality-gate"
+            --analyser local
+            --config "$RUNNER_TEMP/quality/config.yaml"
+            --base "origin/$BASE_REF"
+            --commit "$HEAD_SHA"
+            "${scope[@]}"
+            --coverage-report "$RUNNER_TEMP/quality/measurements/lcov.info"
+            --out "$out/quality.json"
+            --comment-file "$out/comment.md"
+            --summary "$out/summary.md")
+          echo "::group::local"
+          printf '%q ' "${gate[@]}" | tee "$out/command.txt"
+          echo
+          # The exit code of the gate, not of tee. It never ends the step.
+          set +e
+          "${gate[@]}" 2>&1 | tee "$out/output.txt"
+          code=${PIPESTATUS[0]}
+          set -e
+          echo "$code" > "$out/exit-code.txt"
+          echo "gate exit code: $code"
+          echo "::endgroup::"
+
+      # The repository is public: only the result files of Qodana are kept, never its log folder.
+      # Nothing is kept when the text of the token is in one of the files.
+      - name: Collect the Qodana result files
+        if: ${{ !cancelled() }}
+        env:
+          QODANA_TOKEN: ${{ secrets.QODANA_TOKEN }}
+          RESULTS: ${{ runner.temp }}/qodana/results
+        run: |
+          keep="$RUNNER_TEMP/qodana/keep"
+          mkdir -p "$keep"
+          for file in qodana.sarif.json qodana-short.sarif.json start/qodana.sarif.json end/qodana.sarif.json log/changes.json report/results/coverageInformation.json; do
+            if [ -f "$RESULTS/$file" ]; then
+              mkdir -p "$keep/$(dirname "$file")"
+              cp "$RESULTS/$file" "$keep/$file"
+            fi
+          done
+          ls -lR "$keep"
+          if [ -n "$QODANA_TOKEN" ] && grep -rlF -f <(printf '%s' "$QODANA_TOKEN") "$keep"; then
+            echo "The text of the token is in the files named above. Nothing is kept."
+            rm -rf "$keep"
+            exit 1
+          fi
+
+      - name: Keep the Qodana result files
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: qodana-result-files
+          path: ${{ runner.temp }}/qodana/keep
+          if-no-files-found: warn
+
+      - name: Keep the gate reports
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: gate-reports
+          path: ${{ runner.temp }}/quality/out
+          if-no-files-found: warn
+
+      - name: Keep the coverage report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-reports
+          include-hidden-files: true
+          path: .qodana/code-coverage/lcov.info
