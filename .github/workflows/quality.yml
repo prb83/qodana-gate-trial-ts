@@ -59,14 +59,12 @@ jobs:
           cp .qodana/code-coverage/lcov.info "$RUNNER_TEMP/quality/measurements/lcov.info"
 
       # The paid linter checks its licence with the project token. Only this step gets the token.
-      # Qodana runs in a container with the project at /data/project, so `args` names the
-      # coverage directory by its path there.
+      # No coverage directory is named: Qodana looks in .qodana/code-coverage by itself.
       - name: Run Qodana
         uses: JetBrains/qodana-action@v2026.3.1
         env:
           QODANA_TOKEN: ${{ secrets.QODANA_TOKEN }}
         with:
-          args: --coverage-dir /data/project/.qodana/code-coverage
           pr-mode: true
           results-dir: ${{ runner.temp }}/qodana/results
           # The repository is public: the action uploads nothing. See the step that keeps the result files.
